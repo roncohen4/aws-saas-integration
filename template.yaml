@@ -39,10 +39,10 @@ Parameters:
 
   SNSAccountID:
     Type: String
-    Default: "287250355862"
+    Default: "533267298265"
     Description: "This is the AWS account hosting the SNS Entitlement and Subscription topics for your product."
     AllowedValues:
-      - "287250355862"
+      - "533267298265"
 
   SNSRegion:
       Type: String
