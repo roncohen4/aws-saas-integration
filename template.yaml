@@ -1,0 +1,591 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: "AWS Marketplace Serverless SaaS Integration Application"
+Globals:
+  Function:
+    Timeout: 15
+  Api:
+    Cors:
+      AllowMethods: "'POST,OPTIONS'"
+      AllowHeaders: "'*'"
+      AllowOrigin: "'*'"
+      AllowCredentials: "'*'"
+
+Parameters:
+
+  WebsiteS3BucketName:
+    Type: String
+    #AllowedPattern: "(?!(^xn--|.+-s3alias$))^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$"
+    ConstraintDescription: "S3 bucket name must follow S3 recommendations https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html"
+    Default: ""
+
+  NewSubscribersTableName:
+    Type: String
+    AllowedPattern: ".*"
+    Default: "AWSMarketplaceSubscribers"
+
+  AWSMarketplaceMeteringRecordsTableName:
+    Type: String
+    AllowedPattern: ".*"
+    Default: "AWSMarketplaceMeteringRecords"
+
+  TypeOfSaaSListing:
+    Type: String
+    Default: contracts_with_subscription
+    AllowedValues:
+      - contracts_with_subscription
+      - contracts
+      - subscriptions
+
+  SNSAccountID:
+    Type: String
+    Default: "287250355862"
+    Description: "This is the AWS account hosting the SNS Entitlement and Subscription topics for your product."
+    AllowedValues:
+      - "287250355862"
+
+  SNSRegion:
+      Type: String
+      Default: "eu-west-1"
+      Description: "This is the AWS region of the SNS Entitlement and Subscription topics for your product."
+      AllowedValues: 
+        - eu-west-1
+  ProductCode:
+    Type: String
+    AllowedPattern: ".*"
+
+  MarketplaceTechAdminEmail:
+    Type: String
+    AllowedPattern: ".*"
+
+  MarketplaceSellerEmail:
+    Type: String
+    AllowedPattern: ".*"
+    Default: ""
+
+  CreateCrossAccountRole:
+    Default: "false"
+    Description: "Do you intend to use cross account access with this integration core?"
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+  
+  CrossAccountId:
+    Default: ''
+    Description: "Enter the cross AWS account id"
+    Type: String
+
+  CrossAccountRoleName: 
+    Type: String
+    Description: "Your Role Name (ex: OrganizationAccountAccessRole); This will need to be the same across all of the Member Accounts"
+
+  CreateRegistrationWebPage:
+    Default: "true"
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+
+Conditions:
+  CreateEntitlementLogic:
+    Fn::Or:
+      - !Equals [!Ref TypeOfSaaSListing, contracts_with_subscription]
+      - !Equals [!Ref TypeOfSaaSListing, contracts]
+
+  CreateSubscriptionLogic:
+    Fn::Or:
+      - !Equals [!Ref TypeOfSaaSListing, contracts_with_subscription]
+      - !Equals [!Ref TypeOfSaaSListing, subscriptions]
+
+  CreateWeb: !Equals [!Ref CreateRegistrationWebPage, true]
+  Buyernotificationemail: !Not [!Equals [!Ref MarketplaceSellerEmail, ""]]
+  CreateCrossAccount: !Equals [!Ref CreateCrossAccountRole, true]
+
+
+Resources:
+
+  ServerlessApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      MethodSettings:
+        - ResourcePath: /subscriber
+          HttpMethod: POST, OPTIONS
+        - ResourcePath: /redirectmarketplacetoken
+          HttpMethod: POST, OPTIONS
+
+  CrossAccountRoleForSaaSIntegration:
+    Type: AWS::IAM::Role
+    Condition: CreateCrossAccount
+    DependsOn: 
+     - AWSMarketplaceMeteringRecords 
+     - AWSMarketplaceSubscribers
+    Properties:
+      RoleName: !Join ["-", [!Ref "AWS::StackName", !Ref CrossAccountRoleName]]
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Join [":", ["arn:aws:iam:", !Ref CrossAccountId , "root"]]
+            Action:
+              - 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref CrossAccountRoleName
+      Path: /
+      Policies:
+        - PolicyName: !Join ["-", [!Ref "AWS::StackName", "CrossAccountPolicy"]]
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:UpdateItem'
+                Resource:
+                  - !GetAtt AWSMarketplaceMeteringRecords.Arn
+                  - !GetAtt AWSMarketplaceSubscribers.Arn
+                  
+  AWSMarketplaceMeteringRecords:
+    Type: AWS::DynamoDB::Table
+    Condition: CreateSubscriptionLogic
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "customerIdentifier"
+          AttributeType: "S"
+        - AttributeName: "create_timestamp"
+          AttributeType: "N"
+        - AttributeName: "metering_pending"
+          AttributeType: "S"
+
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: "customerIdentifier"
+          KeyType: "HASH"
+        - AttributeName: "create_timestamp"
+          KeyType: "RANGE"
+      GlobalSecondaryIndexes:
+        - IndexName: PendingMeteringRecordsIndex
+          KeySchema:
+            - AttributeName: "metering_pending"
+              KeyType: "HASH"
+          Projection:
+            ProjectionType: ALL
+      TableName: !Ref AWSMarketplaceMeteringRecordsTableName
+
+  AWSMarketplaceSubscribers:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "customerIdentifier"
+          AttributeType: "S"
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: "customerIdentifier"
+          KeyType: "HASH"
+      TableName: !Ref NewSubscribersTableName
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+  
+  RegisterNewMarketplaceCustomer:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: register-new-subscriber.registerNewSubscriber
+      Runtime: nodejs18.x
+      Environment:
+        Variables:
+          NewSubscribersTableName: !Ref NewSubscribersTableName
+          EntitlementQueueUrl:
+            !If [CreateEntitlementLogic, !Ref EntitlementSQSQueue, !Ref AWS::NoValue]
+          MarketplaceSellerEmail:
+            !If [Buyernotificationemail, !Ref MarketplaceSellerEmail, !Ref AWS::NoValue]
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref NewSubscribersTableName
+        - Statement:
+            - Sid: AWSMarketplaceResolveCustomer
+              Effect: Allow
+              Action:
+                - aws-marketplace:ResolveCustomer
+              Resource: "*"
+        - !If
+          - CreateEntitlementLogic
+          - Statement:
+              - Sid: SQSPolicy
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt EntitlementSQSQueue.Arn
+          - !Ref "AWS::NoValue"
+
+        - Statement:
+            - Sid: Sendemail
+              Effect: Allow
+              Action:
+                - ses:SendEmail
+              Resource: "*"
+      Events:
+        RegisterCustomer:
+          Type: Api
+          Properties:
+            Path: /subscriber
+            Method: post
+            RestApiId: !Ref ServerlessApi
+
+  EntitlementSQSQueue:
+    Type: AWS::SQS::Queue
+    Condition: CreateEntitlementLogic
+
+  EntitlementSQSHandler:
+    Type: AWS::Serverless::Function
+    Condition: CreateEntitlementLogic
+    Properties:
+      CodeUri: src
+      Handler: entitlement-sqs.handler
+      Runtime: nodejs18.x
+      Environment:
+        Variables:
+          NewSubscribersTableName: !Ref NewSubscribersTableName
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref NewSubscribersTableName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt EntitlementSQSQueue.Arn
+        - Statement:
+            - Sid: AWSMarketplaceEntitlements
+              Effect: Allow
+              Action:
+                - aws-marketplace:GetEntitlements
+              Resource: "*"
+      Events:
+        MySQSEvent:
+          Type: SNS
+          Properties:
+            Topic:  !Sub 'arn:aws:sns:${SNSRegion}:${SNSAccountID}:aws-mp-entitlement-notification-${ProductCode}'
+            Region: !Sub '${SNSRegion}'
+            SqsSubscription:
+              BatchSize: 1
+              QueueArn: !GetAtt EntitlementSQSQueue.Arn
+              QueueUrl: !Ref EntitlementSQSQueue
+
+  SubscriptionSQSHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src
+      Handler: subscription-sqs.SQSHandler
+      Runtime: nodejs18.x
+      Environment:
+        Variables:
+          NewSubscribersTableName: !Ref NewSubscribersTableName
+          SupportSNSArn: !Ref SupportSNSTopic
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref NewSubscribersTableName
+        - Statement:
+            - Sid: SNSPublish
+              Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref SupportSNSTopic
+      Events:
+        MySQSEvent:
+          Type: SNS
+          Properties:
+            #Topic: !Ref SubscriptionSNSTopic
+            Topic:  !Sub 'arn:aws:sns:${SNSRegion}:${SNSAccountID}:aws-mp-subscription-notification-${ProductCode}'
+            Region: !Sub '${SNSRegion}'
+            SqsSubscription: true
+
+  SupportSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref MarketplaceTechAdminEmail
+          Protocol: email
+
+  GrantOrRevokeAccess:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src
+      Handler: grant-revoke-access-to-product.dynamodbStreamHandler
+      Runtime: nodejs18.x
+      Environment:
+        Variables:
+          SupportSNSArn: !Ref SupportSNSTopic
+          LOG_LEVEL: "info"
+      Policies:
+        - AWSLambdaDynamoDBExecutionRole
+        - Statement:
+            - Sid: SNSPublish
+              Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref SupportSNSTopic
+      Events:
+        Stream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt AWSMarketplaceSubscribers.StreamArn
+            BatchSize: 1
+            StartingPosition: TRIM_HORIZON
+
+  Hourly:
+    Type: AWS::Serverless::Function
+    Condition: CreateSubscriptionLogic
+    Properties:
+      CodeUri: src
+      Handler: metering-hourly-job.job
+      Runtime: nodejs18.x
+      Environment:
+        Variables:
+          SQSMeteringRecordsUrl: !Ref SQSMeteringRecords
+          AWSMarketplaceMeteringRecordsTableName: !Ref AWSMarketplaceMeteringRecordsTableName
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AWSMarketplaceMeteringRecordsTableName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt SQSMeteringRecords.QueueName
+      Events:
+        CWSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: "rate(1 hour)"
+            Name: !Join ["-", [MeteringSchedule, !Ref AWS::StackName]]
+            Description: SaaS Metering
+            Enabled: true
+
+  SQSMeteringRecords:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Join ["-", [!Ref AWS::StackName, SQSMeteringRecords.fifo]]
+      ContentBasedDeduplication: true
+      FifoQueue: true
+      MessageRetentionPeriod: 3000
+    Condition: CreateSubscriptionLogic
+
+  MeteringSQSHandler:
+    Type: AWS::Serverless::Function
+    Condition: CreateSubscriptionLogic
+    Properties:
+      CodeUri: src
+      Handler: metering-sqs.handler
+      Runtime: nodejs18.x
+      Environment:
+        Variables:
+          ProductCode: !Ref ProductCode
+          AWSMarketplaceMeteringRecordsTableName: !Ref AWSMarketplaceMeteringRecordsTableName
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref AWSMarketplaceMeteringRecordsTableName
+        - Statement:
+            - Sid: AWSMarketplaceMetering
+              Effect: Allow
+              Action:
+                - aws-marketplace:BatchMeterUsage
+              Resource: "*"
+      Events:
+        MySQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SQSMeteringRecords.Arn
+            BatchSize: 1
+
+  
+          Bucket: !GetAtt WebsiteS3BucketLog.DomainName
+          IncludeCookies: false
+          Prefix: "access-logs"
+
+  WebsiteS3Bucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateWeb
+    Properties:
+      BucketName: !Ref WebsiteS3BucketName
+
+  WebsiteS3BucketLog:
+    Type: AWS::S3::Bucket
+    Condition: CreateWeb
+    Properties:
+      BucketName: !Join ["-", [!Ref WebsiteS3BucketName, "log"]]
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      IntelligentTieringConfigurations:
+        - Id: !Join ["-", [!Ref WebsiteS3BucketName, "log"]]
+          Status: Enabled
+          Tierings:
+            - AccessTier: ARCHIVE_ACCESS
+              Days: 90
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateWeb
+    Properties:
+      Bucket: !Ref WebsiteS3Bucket
+      PolicyDocument:
+        # Restricting access to cloudfront only.
+        Statement:
+          - Effect: Allow
+            Sid: "AllowCloudFrontServicePrincipal"
+            Action: "s3:GetObject"
+            Resource:
+              - !Sub "arn:aws:s3:::${WebsiteS3Bucket}/*"
+            Principal:
+              Service: "cloudfront.amazonaws.com"
+            Condition:
+              StringEquals: 
+                "AWS:SourceArn" : 
+                  - !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudfrontDistribution}"
+                
+
+  LambdaRedirectPostRequests:
+    Type: AWS::Serverless::Function
+    Condition: CreateWeb
+    Properties:
+      Runtime: nodejs18.x
+      CodeUri: src/
+      Handler: redirect.redirecthandler
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action: "sts:AssumeRole"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+      Environment:
+        Variables:
+          RedirectUrl: https://aws-ia.github.io/cloudformation-aws-marketplace-saas/#_post_deployment_steps
+      Events:
+        RedirectMarketplaceToken:
+          Type: Api
+          Properties:
+            Path: /redirectmarketplacetoken
+            Method: post  
+            RestApiId: !Ref ServerlessApi
+
+  CloudFrontOriginAccessControl:
+    Type: "AWS::CloudFront::OriginAccessControl"
+    Properties: 
+      OriginAccessControlConfig: 
+        Description: !Sub "Origin Access Control for static website - ${AWS::StackName}"
+        Name: !Sub "OAC - ${AWS::StackName}"
+        OriginAccessControlOriginType: "s3"
+        SigningBehavior: "always"
+        SigningProtocol: "sigv4"
+
+
+  CloudfrontDistribution:
+    Type: "AWS::CloudFront::Distribution"
+    Condition: CreateWeb
+    DependsOn: ServerlessApi
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "Cloudfront distribution for serverless website - ${AWS::StackName}"
+        DefaultRootObject: "index.html"
+        Enabled: true
+        HttpVersion: http2
+        # List of origins that Cloudfront will connect to
+        Origins:
+          - Id: s3-website
+            DomainName: !GetAtt WebsiteS3Bucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: api-gateway
+            DomainName: !Sub "${ServerlessApi}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              OriginProtocolPolicy: "https-only"
+              OriginSSLProtocols:
+                - "TLSv1.2"
+              HTTPSPort: 443
+            OriginPath: "/Prod"
+        # To connect the CDN to the origins you need to specify behaviours
+        DefaultCacheBehavior:
+          # Compress resources automatically ( gzip )
+          Compress: true
+          AllowedMethods:
+            - HEAD
+            - DELETE
+            - POST
+            - GET
+            - OPTIONS
+            - PUT
+            - PATCH
+          ForwardedValues:
+            QueryString: false
+          TargetOriginId: s3-website
+          ViewerProtocolPolicy: redirect-to-https
+        CacheBehaviors:
+          - PathPattern: /redirectmarketplacetoken
+            AllowedMethods:
+            - HEAD
+            - DELETE
+            - POST
+            - GET
+            - OPTIONS
+            - PUT
+            - PATCH
+            TargetOriginId: api-gateway
+            ViewerProtocolPolicy: redirect-to-https
+            ResponseHeadersPolicyId: 60669652-455b-4ae9-85a4-c4c02393f86c
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /subscriber
+            AllowedMethods:
+            - HEAD
+            - DELETE
+            - POST
+            - GET
+            - OPTIONS
+            - PUT
+            - PATCH
+            TargetOriginId: api-gateway
+            ViewerProtocolPolicy: redirect-to-https
+            ResponseHeadersPolicyId: 60669652-455b-4ae9-85a4-c4c02393f86c
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        Logging:
+          Bucket: !GetAtt WebsiteS3BucketLog.DomainName
+          IncludeCookies: false
+          Prefix: "access-logs"
+
+
+Outputs:
+  CrossAccountRole:
+    Description: This is the cross account role ARN.
+    Value: 
+      !If [
+        CreateCrossAccount,
+        !GetAtt CrossAccountRoleForSaaSIntegration.Arn,
+        "N/A"
+      ]
+  WebsiteS3Bucket:
+    Description: S3 bucket for hosting the static site. You can retrieve the files at https://github.com/aws-samples/aws-marketplace-serverless-saas-integration/tree/master/web.
+    Value: 
+      !If [
+        CreateWeb,
+        !Sub "https://s3.console.aws.amazon.com/s3/buckets/${WebsiteS3Bucket}/",
+        !Sub "N/A"
+      ]
+
+  LandingPagePreviewURL:
+    Description: URL to preview your landing page. This is NOT the Fulfillment URL for your product.
+    Value:
+      !If [
+        CreateWeb,
+        !Sub "https://${CloudfrontDistribution.DomainName}/index.html",
+        "N/A"
+      ]
+  MarketplaceFulfillmentURL:
+    Description: This is the Marketplace fulfillment URL.
+    Value:
+      !If [
+        CreateWeb,
+        !Sub "https://${CloudfrontDistribution.DomainName}/redirectmarketplacetoken",
+        !Sub "https://${ServerlessApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/redirectmarketplacetoken"
+      ]
